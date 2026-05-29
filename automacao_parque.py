@@ -1,7 +1,6 @@
 """
 =============================================================
   AUTOMAÇÃO DE VERSÕES POS — TMS7 + SGV
-  28/05
 =============================================================
 """
 
@@ -690,441 +689,168 @@ def _salvar_valores_manuais(ws, headers, ultima_linha):
     return saved_teste, saved_adq
 
 
-def _escrever_tms7(wb_xlwings, wb_openpyxl, df_novos):
-    ws = wb_xlwings.sheets[TMS7["sheet"]]
-    headers, ultima = _colunas_e_ultima_linha(ws)
+
+# ──────────────────────────────────────────────────────────
+#  ATUALIZAÇÃO DA BASE  (100% openpyxl — sem xlwings/COM)
+# ──────────────────────────────────────────────────────────
+
+def _ler_manuais_op(ws, headers):
+    """Lê Teste e Adquirido existentes por Número (openpyxl)."""
+    saved_teste, saved_adq = {}, {}
+    if "Número" not in headers or ws.max_row < 2:
+        return saved_teste, saved_adq
+    i_num = headers.index("Número")
+    i_tst = headers.index("Teste") if "Teste" in headers else None
+    i_adq = headers.index("Adquirido") if "Adquirido" in headers else None
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
+        num = row[i_num]
+        if num is None:
+            continue
+        if i_tst is not None:
+            saved_teste[num] = row[i_tst]
+        if i_adq is not None:
+            saved_adq[num] = row[i_adq]
+    qtd_t = sum(1 for v in saved_teste.values() if v not in (None, ""))
+    qtd_a = sum(1 for v in saved_adq.values() if v not in (None, ""))
+    log(f"   💾 Teste: {qtd_t:,}  |  Adquirido: {qtd_a:,}")
+    return saved_teste, saved_adq
+
+
+def _escrever_tms7_op(wb, df_novos):
+    """Escreve dados TMS7 + fórmulas usando apenas openpyxl."""
+    from openpyxl.utils import get_column_letter
+
+    ws = wb[TMS7["sheet"]]
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
     cols_df = list(df_novos.columns)
 
-    saved_teste, saved_adq = _salvar_valores_manuais(ws, headers, ultima)
+    saved_teste, saved_adq = _ler_manuais_op(ws, headers)
+
+    old_max_row = ws.max_row
+
+    # Mapeamento nome → letra da coluna
+    col_ltr = {h: get_column_letter(i + 1) for i, h in enumerate(headers) if h}
+    c_cnpj   = col_ltr.get("CNPJ", "D")
+    c_sub    = col_ltr.get("Sub", "Z")
+    c_intreg = col_ltr.get("Intregração", "AC")
+    c_idprim = col_ltr.get("Id Primário", "H")
 
     idx_num_df = cols_df.index("Número") if "Número" in cols_df else None
 
-    log(f"   ✏️  Preparando {len(df_novos):,} linhas...")
-    dados = []
-    for row in df_novos.itertuples(index=False, name=None):
-        numero = row[idx_num_df] if idx_num_df is not None else None
-        linha = []
-        for h in headers:
+    n = len(df_novos)
+    log(f"   ✏️  Gravando {n:,} linhas...")
+    for ri, row_data in enumerate(df_novos.itertuples(index=False, name=None), start=2):
+        numero = row_data[idx_num_df] if idx_num_df is not None else None
+        for ci, h in enumerate(headers, start=1):
             if h in COLUNAS_FORMULA_TMS7 or h == "Versão TEM":
-                linha.append(None)
+                pass  # fórmulas aplicadas abaixo
             elif h == "Teste":
-                linha.append(saved_teste.get(numero))
+                ws.cell(ri, ci, saved_teste.get(numero))
             elif h == "Adquirido":
-                linha.append(saved_adq.get(numero))
-            elif h == "Integração":
-                linha.append(None)
+                ws.cell(ri, ci, saved_adq.get(numero))
             elif h in cols_df:
-                linha.append(row[cols_df.index(h)])
+                ws.cell(ri, ci, row_data[cols_df.index(h)])
             else:
-                linha.append(None)
-        dados.append(linha)
+                ws.cell(ri, ci, None)
 
-    if ultima > 1:
-        log(f"   🗑️  Removendo {ultima - 1:,} linhas antigas...")
-        last_col_letter = ws.range((1, len(headers))).get_address(False, False).split(":")[0].rstrip("0123456789")
-        ws.range(f"A2:{last_col_letter}{ultima}").clear()
+    # Limpa linhas antigas além do novo tamanho (sem delete_rows — evita corrupção)
+    if old_max_row > n + 1:
+        for ri in range(n + 2, old_max_row + 1):
+            for ci in range(1, len(headers) + 1):
+                ws.cell(ri, ci, None)
+    i_intreg = headers.index("Intregração") + 1 if "Intregração" in headers else None
+    i_cond   = headers.index("Condicional") + 1 if "Condicional" in headers else None
+    i_versao = headers.index("VersãoRecarga") + 1 if "VersãoRecarga" in headers else None
 
-    log(f"   💾 Gravando {len(dados):,} linhas na planilha...")
-    ws.range("A2").value = dados
-
-    formulas_tms7 = {
-        "Intregração": (
-            '=IF(ISERROR(VLOOKUP([@CNPJ],POSIntegrada!B:B,1,0)),"-","MegaGiro")'
-        ),
-        "Condicional": (
-            '=IF([@Sub]&[@Intregração]="RedeFlexMegaGiro","MegaGiro",'
-            'IF([@Sub]&[@Intregração]="SubTal-","SubTal","RedeFlex"))'
-        ),
-        "VersãoRecarga": (
-            "=IFERROR(IFERROR(_xlfn.XLOOKUP([@[Id Primário]],"
-            "'SGV-ParqueRecarga'!C:C,'SGV-ParqueRecarga'!K:K),"
-            "_xlfn.XLOOKUP([@[Id Primário]],"
-            "'TEM-Parque'!B:B,'TEM-Parque'!E:E)),\"\")"
-        ),
-    }
-    n = len(dados)
-    for col_nome, formula in formulas_tms7.items():
-        if col_nome in headers:
-            col_idx = headers.index(col_nome) + 1
-            if n > 0:
-                ws.range((2, col_idx), (n + 1, col_idx)).formula = formula
-                log(f"   📐 Fórmula '{col_nome}' → {n:,} linhas")
-
-    # ── Aplica formatação visual do modelo ──────────────────
-    log("   🎨 Aplicando formatação visual (modelo)...")
-    ws_op = wb_openpyxl[TMS7["sheet"]]
-    _aplicar_formatacao_visual(ws_op, COLWIDTHS_TMS7, TMS7_TABLE_NAME, n)
-
-    log(f"✅ TMS7 → {n:,} registros gravados")
+    log(f"   📐 Aplicando fórmulas ({n:,} linhas)...")
+    for r in range(2, n + 2):
+        if i_intreg:
+            ws.cell(r, i_intreg,
+                f'=IF(ISERROR(VLOOKUP({c_cnpj}{r},POSIntegrada!B:B,1,0)),"-","MegaGiro")')
+        if i_cond:
+            ws.cell(r, i_cond,
+                f'=IF({c_sub}{r}&{c_intreg}{r}="RedeFlexMegaGiro","MegaGiro",'
+                f'IF({c_sub}{r}&{c_intreg}{r}="SubTal-","SubTal","RedeFlex"))')
+        if i_versao:
+            _f = (f'=IFERROR(IFERROR(XLOOKUP({c_idprim}{r},'
+                  f"'SGV-ParqueRecarga'!C:C,'SGV-ParqueRecarga'!K:K),"
+                  f"XLOOKUP({c_idprim}{r},"
+                  f"'TEM-Parque'!B:B,'TEM-Parque'!E:E)),\"\"")
+            ws.cell(r, i_versao, _f)
+    log(f"✅ TMS7 → {n:,} registros")
 
 
-def _escrever_sgv(wb_xlwings, wb_openpyxl, df_novos):
-    ws = wb_xlwings.sheets[SGV["sheet"]]
-    headers, ultima = _colunas_e_ultima_linha(ws)
+def _escrever_sgv_op(wb, df_novos):
+    """Escreve dados SGV usando apenas openpyxl."""
+    ws = wb[SGV["sheet"]]
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
     cols_df = list(df_novos.columns)
     n = len(df_novos)
 
-    dados = []
-    for row in df_novos.itertuples(index=False, name=None):
-        linha = []
-        for h in headers:
-            val = row[cols_df.index(h)] if h in cols_df else None
-            # Remove apostrofe-prefixo do Excel nos campos de série/ICCID
-            if isinstance(val, str) and val.startswith("'"):
-                val = val[1:]
-            linha.append(val)
-        dados.append(linha)
-
-    if ultima > 1:
-        last_col_letter = ws.range((1, len(headers))).get_address(False, False).split(":")[0].rstrip("0123456789")
-        ws.range(f"A2:{last_col_letter}{ultima}").clear()
+    old_max_row_sgv = ws.max_row
 
     log(f"   💾 Gravando {n:,} linhas SGV...")
-    ws.range("A2").value = dados
-
-    # ── Aplica formatação visual do modelo ──────────────────
-    log("   🎨 Aplicando formatação visual (modelo)...")
-    ws_op = wb_openpyxl[SGV["sheet"]]
-    _aplicar_formatacao_visual(ws_op, COLWIDTHS_SGV, SGV_TABLE_NAME, n)
-
-    log(f"✅ SGV → {n:,} registros gravados")
-
-
-# ──────────────────────────────────────────────────────────
-#  ORQUESTRAÇÃO DA ATUALIZAÇÃO
-# ──────────────────────────────────────────────────────────
-
-def _refresh_sincronamente_e_salvar(wb_xlwings, app):
-    """
-    Atualiza conexoes/pivots e salva de forma SINCRONA, evitando
-    o OLE error 0x800ac472.
-
-    Causa raiz: RefreshAll() com BackgroundQuery=True dispara threads
-    separadas no Excel, mantendo o COM objeto perpetuamente ocupado.
-    Mesmo CalculateUntilAsyncQueriesDone() nao resolve porque o Excel
-    usa um mecanismo de lock diferente para essas threads.
-
-    Solucao definitiva:
-      1. Desativa BackgroundQuery em todas as conexoes e PivotCaches
-         -> o refresh passa a ser SINCRONAMENTE bloqueante
-      2. Chama RefreshAll() — Python espera terminar antes de continuar
-      3. Salva via wb.api.Save() (COM direto, sem DisplayAlerts)
-      4. Restaura BackgroundQuery=True nas conexoes
-    """
-    import time as _time
-
-    api = wb_xlwings.api
-
-    # ── Etapa 1: desativa background refresh em todas as conexoes ──
-    log("\u2699\ufe0f  Desativando background refresh nas conexoes...")
-    conexoes_alteradas = []
-    try:
-        for conn in api.Connections:
-            try:
-                conn.OLEDBConnection.BackgroundQuery = False
-                conexoes_alteradas.append(("OLEDB", conn))
-            except Exception:
-                pass
-            try:
-                conn.ODBCConnection.BackgroundQuery = False
-                conexoes_alteradas.append(("ODBC", conn))
-            except Exception:
-                pass
-        log(f"   {len(conexoes_alteradas)} conexao(oes) configurada(s) para refresh sincrono")
-    except Exception as e:
-        log(f"   \u26a0\ufe0f  Conexoes: {e}")
-
-    pivot_caches_alterados = []
-    try:
-        for pc in api.PivotCaches():
-            try:
-                pc.BackgroundQuery = False
-                pivot_caches_alterados.append(pc)
-            except Exception:
-                pass
-        log(f"   {len(pivot_caches_alterados)} PivotCache(s) configurado(s) para refresh sincrono")
-    except Exception as e:
-        log(f"   \u26a0\ufe0f  PivotCaches: {e}")
-
-    # ── Etapa 2: refresh sincrono (bloqueia ate terminar) ──
-    log("\U0001f504 Executando RefreshAll() sincrono...")
-    try:
-        api.RefreshAll()
-        log("   \u2705 RefreshAll() concluido")
-    except Exception as e:
-        log(f"   \u26a0\ufe0f  RefreshAll: {e}")
-
-    _time.sleep(2)  # margem de seguranca
-
-    # ── Etapa 2b: atualiza cada PivotTable explicitamente ──
-    log("🔄 Atualizando tabelas dinâmicas (PivotTables)...")
-    total_pivots = 0
-    for sheet in wb_xlwings.sheets:
-        try:
-            pts = sheet.api.PivotTables()
-            for i in range(1, pts.Count + 1):
-                try:
-                    pt = pts.Item(i)
-                    pt.PivotCache().Refresh()
-                    pt.RefreshTable()
-                    total_pivots += 1
-                    log(f"   ✅ Pivot '{pt.Name}' em '{sheet.name}' atualizado")
-                except Exception as ep:
-                    log(f"   ⚠️  Pivot {i} em '{sheet.name}': {ep}")
-        except Exception:
-            pass
-    if total_pivots == 0:
-        log("   ℹ️  Nenhuma PivotTable encontrada")
-    else:
-        log(f"   ✅ {total_pivots} PivotTable(s) atualizadas")
-    _time.sleep(1)  # margem extra apos pivots
-
-    # ── Etapa 3: salva via COM direto ──
-    log("\U0001f4be Salvando arquivo...")
-    api.Save()
-    log("   \u2705 Arquivo salvo com sucesso")
-
-    # ── Etapa 4: restaura background refresh ──
-    for tipo, conn in conexoes_alteradas:
-        try:
-            if tipo == "OLEDB":
-                conn.OLEDBConnection.BackgroundQuery = True
+    for ri, row_data in enumerate(df_novos.itertuples(index=False, name=None), start=2):
+        for ci, h in enumerate(headers, start=1):
+            if h in cols_df:
+                val = row_data[cols_df.index(h)]
+                if isinstance(val, str) and val.startswith("'"):
+                    val = val[1:]
+                ws.cell(ri, ci, val)
             else:
-                conn.ODBCConnection.BackgroundQuery = True
-        except Exception:
-            pass
-    for pc in pivot_caches_alterados:
-        try:
-            pc.BackgroundQuery = True
-        except Exception:
-            pass
-    log("\u2705 Background refresh restaurado")
+                ws.cell(ri, ci, None)
+
+    # Limpa linhas antigas além do novo tamanho
+    if old_max_row_sgv > n + 1:
+        for ri in range(n + 2, old_max_row_sgv + 1):
+            for ci in range(1, len(headers) + 1):
+                ws.cell(ri, ci, None)
+
+    _aplicar_formatacao_visual(ws, COLWIDTHS_SGV, SGV_TABLE_NAME, n)
+    log(f"✅ SGV → {n:,} registros")
 
 
 def atualizar_base(arq_tms7, arq_sgv):
     global BASE_ARQUIVO
     log("─" * 50)
-    log("📊 Atualizando base Excel (xlwings + openpyxl)...")
+    log("📊 Atualizando base Excel (openpyxl)...")
     fazer_backup()
 
     if not BASE_ARQUIVO.exists():
         log(f"❌ Base não encontrada: {BASE_ARQUIVO}")
-        log("   ➡️  Coloque a base na mesma pasta que o automacao.py")
+        log("   ➡️  Coloque a base na mesma pasta que o automacao_parque.py")
         return
 
     try:
-        import xlwings as xw
-    except ImportError:
-        log("❌ xlwings não instalado. Execute:  pip install xlwings")
-        return
+        df_tms7 = ler_relatorio(arq_tms7) if arq_tms7 and arq_tms7.exists() else None
+        df_sgv  = ler_relatorio(arq_sgv)  if arq_sgv  and arq_sgv.exists()  else None
 
-    import time
-    import tempfile
-
-    # ── Copia para caminho temporário sem acentos ──────────────────────────────
-    # O COM do Excel invisível falha em pastas com acentos (ex: "Automação").
-    # Solução: trabalhar em %TEMP% com nome simples e copiar de volta no final.
-    tmp_xlsx = Path(tempfile.gettempdir()) / "automacao_base_tmp.xlsx"
-    try:
-        shutil.copy2(BASE_ARQUIVO, tmp_xlsx)
-        log(f"   📋 Cópia temporária → {tmp_xlsx.name}")
-    except PermissionError:
-        log("❌ Arquivo aberto no Excel — feche-o e tente novamente.")
-        return
-    except Exception as e:
-        log(f"❌ Erro ao copiar base: {e}")
-        return
-
-    app = xw.App(visible=True, add_book=False)
-    try:
-        # Desativa Protected View e segurança de automação (evita falha no Open invisível)
-        app.api.AutomationSecurity = 1  # msoAutomationSecurityLow
-        app.api.DisplayAlerts = False
-        wb_xlwings = app.books.open(str(tmp_xlsx), update_links=False)
-        app.api.Visible = False  # esconde após abrir com sucesso
-
-        df_tms7 = None
-        df_sgv  = None
-
-        if arq_tms7 and arq_tms7.exists():
-            df_tms7 = ler_relatorio(arq_tms7)
-
-        if arq_sgv and arq_sgv.exists():
-            df_sgv = ler_relatorio(arq_sgv)
-
-        # ── Fase 1: xlwings escreve dados e fórmulas ──
-        if df_tms7 is not None:
-            _escrever_tms7_dados(wb_xlwings, df_tms7)
-
-        if df_sgv is not None:
-            _escrever_sgv_dados(wb_xlwings, df_sgv)
-
-        log("🔄 Atualizando tabelas dinâmicas e fórmulas...")
-        _refresh_sincronamente_e_salvar(wb_xlwings, app)
-        log("✅ Dados gravados na cópia temporária.")
-        wb_xlwings.close()
-
-        # ── Fase 2: openpyxl aplica formatação visual ──
-        log("🎨 Aplicando formatação visual com openpyxl...")
-        wb_op = load_workbook(str(tmp_xlsx))
+        log("📂 Abrindo base...")
+        wb = load_workbook(str(BASE_ARQUIVO))
 
         if df_tms7 is not None:
-            ws_op = wb_op[TMS7["sheet"]]
-            _aplicar_formatacao_visual(ws_op, COLWIDTHS_TMS7, TMS7_TABLE_NAME, len(df_tms7))
+            _escrever_tms7_op(wb, df_tms7)
 
         if df_sgv is not None:
-            ws_op = wb_op[SGV["sheet"]]
-            _aplicar_formatacao_visual(ws_op, COLWIDTHS_SGV, SGV_TABLE_NAME, len(df_sgv))
+            _escrever_sgv_op(wb, df_sgv)
 
-        wb_op.save(str(tmp_xlsx))
-        wb_op.close()
+        # Marca pivot tables para auto-refresh ao abrir no Excel
+        for sname in wb.sheetnames:
+            for pt in getattr(wb[sname], "_pivots", []):
+                try:
+                    pt.cache.refreshOnLoad = True
+                except Exception:
+                    pass
 
-        # ── Copia o resultado de volta para o destino original ──
-        shutil.copy2(tmp_xlsx, BASE_ARQUIVO)
-        log(f"✅ Arquivo atualizado → {BASE_ARQUIVO.name}")
+        wb.save(str(BASE_ARQUIVO))
+        log(f"✅ Base salva → {BASE_ARQUIVO.name}")
+        log("   💡 Ao abrir no Excel, fórmulas calculam e tabelas dinâmicas atualizam automaticamente.")
 
     except Exception as e:
         log(f"❌ Erro ao atualizar base: {e}")
         import traceback
         log(traceback.format_exc())
-    finally:
-        try:
-            app.quit()
-        except Exception:
-            pass
-        try:
-            tmp_xlsx.unlink(missing_ok=True)
-        except Exception:
-            pass
 
-
-
-# ── Funções auxiliares separadas (dados via xlwings) ──────
-
-def _escrever_tms7_dados(wb_xlwings, df_novos):
-    """Escreve dados e fórmulas via xlwings (sem formatação visual)."""
-    ws = wb_xlwings.sheets[TMS7["sheet"]]
-    headers, ultima = _colunas_e_ultima_linha(ws)
-    cols_df = list(df_novos.columns)
-
-    saved_teste, saved_adq = _salvar_valores_manuais(ws, headers, ultima)
-    idx_num_df = cols_df.index("Número") if "Número" in cols_df else None
-
-    log(f"   ✏️  Preparando {len(df_novos):,} linhas (TMS7)...")
-    dados = []
-    for row in df_novos.itertuples(index=False, name=None):
-        numero = row[idx_num_df] if idx_num_df is not None else None
-        linha = []
-        for h in headers:
-            if h in COLUNAS_FORMULA_TMS7 or h == "Versão TEM":
-                linha.append(None)
-            elif h == "Teste":
-                linha.append(saved_teste.get(numero))
-            elif h == "Adquirido":
-                linha.append(saved_adq.get(numero))
-            elif h == "Integração":
-                linha.append(None)
-            elif h in cols_df:
-                linha.append(row[cols_df.index(h)])
-            else:
-                linha.append(None)
-        dados.append(linha)
-
-    if ultima > 1:
-        log(f"   🗑️  Removendo {ultima - 1:,} linhas antigas...")
-        last_col_letter = ws.range((1, len(headers))).get_address(False, False).split(":")[0].rstrip("0123456789")
-        ws.range(f"A2:{last_col_letter}{ultima}").clear()
-
-    log(f"   💾 Gravando {len(dados):,} linhas na planilha...")
-    ws.range("A2").value = dados
-
-    n = len(dados)
-
-    # ── Resize da tabela usando ws.api.Range() (mais confiavel que .api do xlwings) ──
-    if n > 0:
-        try:
-            import re as _re
-            tabela = ws.api.ListObjects(TMS7_TABLE_NAME)
-            # Extrai a ultima coluna do range atual da tabela (ex: "AF" de "$A$1:$AF$14929")
-            tbl_addr = tabela.Range.Address.replace('$', '')
-            m = _re.match(r'([A-Z]+)\d+:([A-Z]+)\d+', tbl_addr)
-            last_tbl_col = m.group(2) if m else "AF"
-            nova_area = ws.api.Range(f"A1:{last_tbl_col}{n + 1}")
-            tabela.Resize(nova_area)
-            log(f"   📏 Tabela '{TMS7_TABLE_NAME}' redimensionada → A1:{last_tbl_col}{n + 1}")
-        except Exception as e:
-            log(f"   ⚠️  Resize da tabela: {e}")
-
-    # ── Fórmulas com referências diretas de célula (independem do resize da tabela) ──
-    # Usa D2, Z2, AC2 etc. — o Excel ajusta automaticamente para cada linha da coluna
-    if n > 0:
-        from openpyxl.utils import get_column_letter as _gcl
-
-        def _col(nome):
-            return _gcl(headers.index(nome) + 1) if nome in headers else None
-
-        c_cnpj   = _col("CNPJ")
-        c_sub    = _col("Sub")
-        c_intreg = _col("Intregração")
-        c_idprim = _col("Id Primário")
-
-        formulas_tms7 = {}
-
-        if c_cnpj:
-            formulas_tms7["Intregração"] = (
-                f'=IF(ISERROR(VLOOKUP({c_cnpj}2,POSIntegrada!B:B,1,0)),"-","MegaGiro")'
-            )
-        if c_sub and c_intreg:
-            formulas_tms7["Condicional"] = (
-                f'=IF({c_sub}2&{c_intreg}2="RedeFlexMegaGiro","MegaGiro",'
-                f'IF({c_sub}2&{c_intreg}2="SubTal-","SubTal","RedeFlex"))'
-            )
-        if c_idprim:
-            formulas_tms7["VersãoRecarga"] = (
-                f"=IFERROR(IFERROR(_xlfn.XLOOKUP({c_idprim}2,"
-                f"'SGV-ParqueRecarga'!C:C,'SGV-ParqueRecarga'!K:K),"
-                f"_xlfn.XLOOKUP({c_idprim}2,"
-                f"'TEM-Parque'!B:B,'TEM-Parque'!E:E)),\"\")"
-            )
-
-        for col_nome, formula in formulas_tms7.items():
-            if col_nome in headers:
-                col_idx = headers.index(col_nome) + 1
-                ws.range((2, col_idx), (n + 1, col_idx)).formula = formula
-                log(f"   📐 Fórmula '{col_nome}' → {n:,} linhas")
-
-    log(f"✅ TMS7 dados → {n:,} registros")
-
-def _escrever_sgv_dados(wb_xlwings, df_novos):
-    """Escreve dados via xlwings (sem formatação visual)."""
-    ws = wb_xlwings.sheets[SGV["sheet"]]
-    headers, ultima = _colunas_e_ultima_linha(ws)
-    cols_df = list(df_novos.columns)
-    n = len(df_novos)
-
-    dados = []
-    for row in df_novos.itertuples(index=False, name=None):
-        linha = []
-        for h in headers:
-            val = row[cols_df.index(h)] if h in cols_df else None
-            # Remove apostrofe-prefixo do Excel nos campos de série/ICCID
-            if isinstance(val, str) and val.startswith("'"):
-                val = val[1:]
-            linha.append(val)
-        dados.append(linha)
-
-    if ultima > 1:
-        last_col_letter = ws.range((1, len(headers))).get_address(False, False).split(":")[0].rstrip("0123456789")
-        ws.range(f"A2:{last_col_letter}{ultima}").clear()
-
-    log(f"   💾 Gravando {n:,} linhas SGV...")
-    ws.range("A2").value = dados
-    log(f"✅ SGV dados → {n:,} registros")
-
-
-# ──────────────────────────────────────────────────────────
-#  MAIN
-# ──────────────────────────────────────────────────────────
 def ultimo_arquivo(pasta: Path, prefixo: str):
     arquivos = sorted(pasta.glob(f"{prefixo}_*"), reverse=True)
     return arquivos[0] if arquivos else None
